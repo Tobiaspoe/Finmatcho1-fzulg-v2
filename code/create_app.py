@@ -6,88 +6,28 @@ import functools
 import json
 import logging
 import mimetypes
-from os import path
 import sys
-import re
+from os import path
 import requests
+from flask import Flask, Response, request, Request, jsonify
 from openai import AzureOpenAI, Stream, APIStatusError
 from openai.types.chat import ChatCompletionChunk
-from flask import Flask, Response, request, Request, jsonify
 from dotenv import load_dotenv
-from urllib.parse import quote
+
+# If you're keeping some helper logic (like env loading or orchestrator), keep these:
 from backend.batch.utilities.helpers.env_helper import EnvHelper
-from backend.batch.utilities.helpers.azure_search_helper import AzureSearchHelper
 from backend.batch.utilities.helpers.orchestrator_helper import Orchestrator
 from backend.batch.utilities.helpers.config.config_helper import ConfigHelper
 from backend.batch.utilities.helpers.config.conversation_flow import ConversationFlow
 from backend.api.chat_history import bp_chat_history_response
-from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
-from azure.identity import DefaultAzureCredential
-from backend.batch.utilities.helpers.azure_blob_storage_client import (
-    AzureBlobStorageClient,
-)
 
 ERROR_429_MESSAGE = "We're currently experiencing a high number of requests for the service you're trying to access. Please wait a moment and try again."
 ERROR_GENERIC_MESSAGE = "An error occurred. Please try again. If the problem persists, please contact the site administrator."
 logger = logging.getLogger(__name__)
 
 
-def get_markdown_url(source, title, container_sas):
-    """Get Markdown URL for a citation"""
-
-    url = quote(source, safe=":/")
-    if "_SAS_TOKEN_PLACEHOLDER_" in url:
-        url = url.replace("_SAS_TOKEN_PLACEHOLDER_", container_sas)
-    return f"[{title}]({url})"
-
-
-def get_citations(citation_list):
-    """Returns Formated Citations."""
-    logger.info("Method get_citations started")
-    blob_client = AzureBlobStorageClient()
-    container_sas = blob_client.get_container_sas()
-    citations_dict = {"citations": []}
-    for citation in citation_list.get("citations"):
-        metadata = (
-            json.loads(citation["url"])
-            if isinstance(citation["url"], str)
-            else citation["url"]
-        )
-        title = citation["title"]
-        url = get_markdown_url(metadata["source"], title, container_sas)
-        citations_dict["citations"].append(
-            {
-                "content": url + "\n\n\n" + citation["content"],
-                "id": metadata["id"],
-                "chunk_id": (
-                    re.findall(r"\d+", metadata["chunk_id"])[-1]
-                    if metadata["chunk_id"] is not None
-                    else metadata["chunk"]
-                ),
-                "title": title,
-                "filepath": title.split("/")[-1],
-                "url": url,
-            }
-        )
-    logger.info("Method get_citations ended")
-    return citations_dict
-
-
-def should_use_data(
-    env_helper: EnvHelper, azure_search_helper: AzureSearchHelper
-) -> bool:
-    if (
-        env_helper.AZURE_SEARCH_SERVICE
-        and env_helper.AZURE_SEARCH_INDEX
-        and (env_helper.AZURE_SEARCH_KEY or env_helper.AZURE_AUTH_TYPE == "rbac")
-        and not azure_search_helper._index_not_exists(env_helper.AZURE_SEARCH_INDEX)
-    ):
-        return True
-    return False
-
-
-def stream_with_data(response: Stream[ChatCompletionChunk]):
-    """This function streams the response from Azure OpenAI with data."""
+def stream_response(response: Stream[ChatCompletionChunk]):
+    """Stream OpenAI chat completion response without custom data/citations."""
     response_obj = {
         "id": "",
         "model": "",
@@ -99,17 +39,31 @@ def stream_with_data(response: Stream[ChatCompletionChunk]):
                     {
                         "content": "",
                         "end_turn": False,
-                        "role": "tool",
-                    },
-                    {
-                        "content": "",
-                        "end_turn": False,
                         "role": "assistant",
-                    },
+                    }
                 ]
             }
         ],
     }
+
+    for line in response:
+        choice = line.choices[0]
+
+        if choice.model_extra.get("end_turn"):
+            response_obj["choices"][0]["messages"][0]["end_turn"] = True
+            yield json.dumps(response_obj, ensure_ascii=False) + "\n"
+            return
+
+        response_obj["id"] = line.id
+        response_obj["model"] = line.model
+        response_obj["created"] = line.created
+        response_obj["object"] = line.object
+
+        delta = choice.delta
+        response_obj["choices"][0]["messages"][0]["content"] += delta.content or ""
+
+        yield json.dumps(response_obj, ensure_ascii=False) + "\n"
+
 
     for line in response:
         choice = line.choices[0]
@@ -139,9 +93,10 @@ def stream_with_data(response: Stream[ChatCompletionChunk]):
         yield json.dumps(response_obj, ensure_ascii=False) + "\n"
 
 
-def conversation_with_data(conversation: Request, env_helper: EnvHelper):
-    """This function streams the response from Azure OpenAI with data."""
-    logger.info("Method conversation_with_data started")
+def conversation_openai(conversation: Request, env_helper: EnvHelper):
+    """This function streams the response from Azure OpenAI without using Azure Search."""
+    logger.info("Method conversation_openai started")
+
     if env_helper.is_auth_type_keys():
         logger.info("Using key-based authentication for Azure OpenAI")
         openai_client = AzureOpenAI(
@@ -159,6 +114,7 @@ def conversation_with_data(conversation: Request, env_helper: EnvHelper):
 
     request_messages = conversation.json["messages"]
     messages = []
+
     config = ConfigHelper.get_active_config_or_default()
     if config.prompts.use_on_your_data_format:
         messages.append(
@@ -168,8 +124,7 @@ def conversation_with_data(conversation: Request, env_helper: EnvHelper):
     for message in request_messages:
         messages.append({"role": message["role"], "content": message["content"]})
 
-    # Azure OpenAI takes the deployment name as the model name, "AZURE_OPENAI_MODEL" means
-    # deployment name.
+    # Create the completion request WITHOUT Azure Search
     response = openai_client.chat.completions.create(
         model=env_helper.AZURE_OPENAI_MODEL,
         messages=messages,
@@ -182,66 +137,9 @@ def conversation_with_data(conversation: Request, env_helper: EnvHelper):
             else None
         ),
         stream=env_helper.SHOULD_STREAM,
-        extra_body={
-            "data_sources": [
-                {
-                    "type": "azure_search",
-                    "parameters": {
-                        "authentication": (
-                            {
-                                "type": "api_key",
-                                "key": env_helper.AZURE_SEARCH_KEY,
-                            }
-                            if env_helper.is_auth_type_keys()
-                            else {
-                                "type": "system_assigned_managed_identity",
-                            }
-                        ),
-                        "endpoint": env_helper.AZURE_SEARCH_SERVICE,
-                        "index_name": env_helper.AZURE_SEARCH_INDEX,
-                        "fields_mapping": {
-                            "content_fields": (
-                                env_helper.AZURE_SEARCH_CONTENT_COLUMN.split("|")
-                                if env_helper.AZURE_SEARCH_CONTENT_COLUMN
-                                else []
-                            ),
-                            "vector_fields": [
-                                env_helper.AZURE_SEARCH_CONTENT_VECTOR_COLUMN
-                            ],
-                            "title_field": env_helper.AZURE_SEARCH_TITLE_COLUMN or None,
-                            "url_field": env_helper.AZURE_SEARCH_FIELDS_METADATA
-                            or None,
-                            "filepath_field": (
-                                env_helper.AZURE_SEARCH_FILENAME_COLUMN or None
-                            ),
-                        },
-                        "filter": env_helper.AZURE_SEARCH_FILTER,
-                        "in_scope": env_helper.AZURE_SEARCH_ENABLE_IN_DOMAIN,
-                        "top_n_documents": env_helper.AZURE_SEARCH_TOP_K,
-                        "embedding_dependency": {
-                            "type": "deployment_name",
-                            "deployment_name": env_helper.AZURE_OPENAI_EMBEDDING_MODEL,
-                        },
-                        "query_type": (
-                            "vector_semantic_hybrid"
-                            if env_helper.AZURE_SEARCH_USE_SEMANTIC_SEARCH
-                            else "vector_simple_hybrid"
-                        ),
-                        "semantic_configuration": (
-                            env_helper.AZURE_SEARCH_SEMANTIC_SEARCH_CONFIG
-                            if env_helper.AZURE_SEARCH_USE_SEMANTIC_SEARCH
-                            and env_helper.AZURE_SEARCH_SEMANTIC_SEARCH_CONFIG
-                            else ""
-                        ),
-                        "role_information": env_helper.AZURE_OPENAI_SYSTEM_MESSAGE,
-                    },
-                }
-            ]
-        },
     )
 
     if not env_helper.SHOULD_STREAM:
-        citations = get_citations(response.choices[0].message.model_extra["context"])
         response_obj = {
             "id": response.id,
             "model": response.model,
@@ -251,28 +149,18 @@ def conversation_with_data(conversation: Request, env_helper: EnvHelper):
                 {
                     "messages": [
                         {
-                            "content": json.dumps(
-                                citations,
-                                ensure_ascii=False,
-                            ),
-                            "end_turn": False,
-                            "role": "tool",
-                        },
-                        {
                             "end_turn": True,
                             "content": response.choices[0].message.content,
                             "role": "assistant",
-                        },
+                        }
                     ]
                 }
             ],
         }
-
         return response_obj
 
-    logger.info("Method conversation_with_data ended")
-    return Response(stream_with_data(response), mimetype="application/json-lines")
-
+    logger.info("Method conversation_openai ended")
+    return Response(stream_response(response), mimetype="application/json-lines")
 
 def stream_without_data(response: Stream[ChatCompletionChunk]):
     """This function streams the response from Azure OpenAI without data."""
@@ -401,7 +289,6 @@ def create_app():
 
     app = Flask(__name__)
     env_helper: EnvHelper = EnvHelper()
-    azure_search_helper: AzureSearchHelper = AzureSearchHelper()
 
     logger.debug("Starting web app")
 
@@ -416,26 +303,23 @@ def create_app():
 
     def conversation_azure_byod():
         logger.info("Method conversation_azure_byod started")
-        try:
-            if should_use_data(env_helper, azure_search_helper):
-                return conversation_with_data(request, env_helper)
-            else:
-                return conversation_without_data(request, env_helper)
-        except APIStatusError as e:
-            error_message = str(e)
-            logger.exception("Exception in /api/conversation | %s", error_message)
-            response_json = e.response.json()
-            response_message = response_json.get("error", {}).get("message", "")
-            response_code = response_json.get("error", {}).get("code", "")
-            if response_code == "429" or "429" in response_message:
-                return jsonify({"error": ERROR_429_MESSAGE}), 429
-            return jsonify({"error": ERROR_GENERIC_MESSAGE}), 500
-        except Exception as e:
-            error_message = str(e)
-            logger.exception("Exception in /api/conversation | %s", error_message)
-            return jsonify({"error": ERROR_GENERIC_MESSAGE}), 500
-        finally:
-            logger.info("Method conversation_azure_byod ended")
+    try:
+        return conversation_without_data(request, env_helper)
+    except APIStatusError as e:
+        error_message = str(e)
+        logger.exception("Exception in /api/conversation | %s", error_message)
+        response_json = e.response.json()
+        response_message = response_json.get("error", {}).get("message", "")
+        response_code = response_json.get("error", {}).get("code", "")
+        if response_code == "429" or "429" in response_message:
+            return jsonify({"error": ERROR_429_MESSAGE}), 429
+        return jsonify({"error": ERROR_GENERIC_MESSAGE}), 500
+    except Exception as e:
+        error_message = str(e)
+        logger.exception("Exception in /api/conversation | %s", error_message)
+        return jsonify({"error": ERROR_GENERIC_MESSAGE}), 500
+    finally:
+        logger.info("Method conversation_azure_byod ended")
 
     async def conversation_custom():
         message_orchestrator = get_message_orchestrator()
